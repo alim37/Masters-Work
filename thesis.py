@@ -78,7 +78,6 @@ class TargetTrackerNode(Node):
         self.have_yaw = True
 
     def find_trajectory_point_ahead(self):
-        """Find point on ego's stored trajectory at lookahead distance"""
         if len(self.ego_trajectory) < 10:
             return None
         
