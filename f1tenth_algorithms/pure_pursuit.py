@@ -23,12 +23,7 @@ class PurePursuitNode(Node):
             [6, 0],
             [7, 0],
             [8,0],
-            #[8.9473, 0],
             [9.5, 0],
-            #[9.2211, 0.0591],
-            #[9.6555, 0.3607],
-            #[9.9239, 1.0871],
-           # [9.7781, 2.0921],
             [9.8000, 3.0000],
             [9.8000, 4.0000],
             [9.8000, 5.0000],
@@ -40,27 +35,6 @@ class PurePursuitNode(Node):
             [8.9921, 8.3980],
             [7.7689, 8.4908],
             [7.0000, 8.5759],
-            
-           # [6.0000, 8.5759],
-            #[5.0000, 8.5759],
-           # [4.0000, 8.5759],
-           # [3.0000, 8.5759],
-           # [2.0000, 8.5759],
-          #  [1.0000, 8.5759],
-            #[0.0000, 8.5759],
-           # [-1.0000, 8.5759],
-           # [-2.0000, 8.5759],
-           # [-3.0000, 8.5759],
-          #  [-4.0000, 8.5759],
-          #  [-5.0000, 8.5759],
-         #   [-6.0000, 8.5759],
-          #  [-7.0000, 8.5759],
-         #   [-8.0000, 8.5759],
-           # [-9.0000, 8.5759],
-           # [-10.0000, 8.5759],
-           # [-11.0000, 8.5759],
-          #  [-12.0000, 8.5759],
-            #[-12.4353, 8.5759],
             [6.0000, 9.1],
             [5.0000, 9.1],
             [4.0000, 9.1],
@@ -81,9 +55,6 @@ class PurePursuitNode(Node):
             [-11.0000, 9.1],
             [-12.0000, 9.1],
             [-13.0, 9.1],
-            #[-12.9307, 8.3914],
-            #[-13.3309, 7.8879],
-            #[-13.6016, 6.5028],
             [-14, 6.0000],
             [-14, 5.0000],
             [-14, 4.0000],
@@ -192,23 +163,6 @@ class PurePursuitNode(Node):
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
         return roll, pitch, yaw
-    
-    #def plot_velocity(self):
-    #    plt.figure(figsize=(10,6))
-    #    plt.plot(self.times, self.velocities)
-    #    plt.xlabel('Time (s)')
-    #    plt.ylabel('Total velocity (m/s)')
-    #    plt.grid(True)
-    #    
-    #    save_dir = os.path.expanduser('~/graphs/velocity_vs_time.png')
-    #    os.makedirs(save_dir, exist_ok=True)
-    #    
-    #    save_path = os.path.join(save_dir, 'velocity_vs_time_pp.png')
-    #    plt.savefig(save_path)
-    #    plt.show()
-    #    plt.close()
-    #    
-    #    self.get_logger().info(f'Graph saved to: {save_path}')
 
     def save_data(self):
         save_dir = os.path.expanduser('~/data_pp')
