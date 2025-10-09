@@ -19,7 +19,6 @@ class WallFollowerNode(Node):
 
         self.kp = 3.0
         self.ki = 0.001
-        #self.ki = 0.00
         self.kd = 0.10
 
         self.prev_error = 0.0
