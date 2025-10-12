@@ -52,7 +52,7 @@ DEVIATION_HISTORY_SIZE = 5
 MIN_POINTS_FOR_DEVIATION = 5
 
 # Visualization
-NUM_LINE_POINTS = 8
+NUM_LINE_POINTS = 15
 DOT_SIZE = 0.12
 # =======================================
 
@@ -421,67 +421,131 @@ class DynamicTargetTracker(Node):
 
     def publish_visualization(self, stamp):
         """
-        Visualize deviation: 
-        - Green dots = aligned (straight)
-        - Yellow dots = deviating (turning)
-        - Blue dots = IPS fallback
+        Visualize actual LiDAR points colored by lateral deviation.
+        Shows the real geometric signature of turning.
         """
         ma = MarkerArray()
         
-        if self.target_position is None:
-            # Clear
-            for i in range(NUM_LINE_POINTS + 1):
-                m = Marker()
-                m.header.frame_id = FRAME_ID
-                m.header.stamp = stamp
-                m.ns = 'deviation'
-                m.id = i
-                m.action = Marker.DELETE
-                ma.markers.append(m)
-            self.marker_pub.publish(ma)
-            return
-        
-        # Draw line from ego to target
-        ego_pos = np.array([self.x_e, self.y_e])
-        target_pos = self.target_position
-        
-        for i in range(NUM_LINE_POINTS):
-            t = i / (NUM_LINE_POINTS - 1)
-            point = ego_pos + t * (target_pos - ego_pos)
-            
+        # Clear old markers (up to 200 to handle varying point counts)
+        for i in range(200):
             m = Marker()
             m.header.frame_id = FRAME_ID
             m.header.stamp = stamp
-            m.ns = 'deviation'
+            m.ns = 'lidar_points'
             m.id = i
-            m.type = Marker.SPHERE
-            m.action = Marker.ADD
-            m.pose.position.x = float(point[0])
-            m.pose.position.y = float(point[1])
-            m.pose.position.z = 0.1
-            m.pose.orientation.w = 1.0
-            m.scale.x = m.scale.y = m.scale.z = DOT_SIZE
-            
-            # Color based on state
-            if self.using_ips_fallback:
-                # Blue = using IPS trajectory
-                m.color.r, m.color.g, m.color.b = 0.0, 0.5, 1.0
-            elif self.current_deviation > DEVIATION_THRESHOLD:
-                # Yellow = turning detected
-                m.color.r, m.color.g, m.color.b = 1.0, 1.0, 0.0
-            else:
-                # Green = straight
-                m.color.r, m.color.g, m.color.b = 0.0, 1.0, 0.0
-            
-            m.color.a = self.tracking_confidence
+            m.action = Marker.DELETE
             ma.markers.append(m)
+        
+        if self.target_position is None:
+            self.marker_pub.publish(ma)
+            return
+        
+        ego_pos = np.array([self.x_e, self.y_e])
+        target_pos = self.target_position
+        
+        # If we have actual LiDAR points, visualize them
+        if self.target_points_ego is not None and not self.using_ips_fallback:
+            # Transform ego frame points to world frame
+            Rw = rot2d(self.yaw_e)
+            cluster_points_world = (Rw @ self.target_points_ego.T).T + ego_pos
+            
+            # Calculate centerline in ego frame (for deviation calculation)
+            centerline_vec = target_pos - ego_pos
+            centerline_length = np.linalg.norm(centerline_vec)
+            
+            if centerline_length > 0.01:
+                centerline_unit = centerline_vec / centerline_length
+                
+                # For each LiDAR point, calculate lateral deviation from centerline
+                for i, point_world in enumerate(cluster_points_world):
+                    # Vector from ego to this point
+                    vec_to_point = point_world - ego_pos
+                    
+                    # Project onto centerline to get longitudinal distance
+                    projection_length = np.dot(vec_to_point, centerline_unit)
+                    projection_point = ego_pos + projection_length * centerline_unit
+                    
+                    # Perpendicular distance = lateral deviation
+                    lateral_deviation = np.linalg.norm(point_world - projection_point)
+                    
+                    # Create marker for this LiDAR point
+                    m = Marker()
+                    m.header.frame_id = FRAME_ID
+                    m.header.stamp = stamp
+                    m.ns = 'lidar_points'
+                    m.id = i
+                    m.type = Marker.SPHERE
+                    m.action = Marker.ADD
+                    m.pose.position.x = float(point_world[0])
+                    m.pose.position.y = float(point_world[1])
+                    m.pose.position.z = 0.1
+                    m.pose.orientation.w = 1.0
+                    m.scale.x = m.scale.y = m.scale.z = DOT_SIZE * 1.2  # Slightly larger
+                    
+                    # Color based on lateral deviation
+                    if lateral_deviation > DEVIATION_THRESHOLD:
+                        # Yellow/Orange = deviating (turning signature)
+                        m.color.r, m.color.g, m.color.b = 1.0, 0.8, 0.0
+                    else:
+                        # Green = aligned with centerline (straight)
+                        m.color.r, m.color.g, m.color.b = 0.0, 1.0, 0.0
+                    
+                    m.color.a = 1.0
+                    ma.markers.append(m)
+                
+                # Add centerline visualization (thin gray line)
+                centerline_marker = Marker()
+                centerline_marker.header.frame_id = FRAME_ID
+                centerline_marker.header.stamp = stamp
+                centerline_marker.ns = 'lidar_points'
+                centerline_marker.id = 150
+                centerline_marker.type = Marker.LINE_STRIP
+                centerline_marker.action = Marker.ADD
+                
+                # Line from ego to target
+                p1 = Point()
+                p1.x, p1.y, p1.z = float(ego_pos[0]), float(ego_pos[1]), 0.05
+                p2 = Point()
+                p2.x, p2.y, p2.z = float(target_pos[0]), float(target_pos[1]), 0.05
+                
+                centerline_marker.points = [p1, p2]
+                centerline_marker.scale.x = 0.02  # Line width
+                centerline_marker.color.r = 0.7
+                centerline_marker.color.g = 0.7
+                centerline_marker.color.b = 0.7
+                centerline_marker.color.a = 0.5
+                ma.markers.append(centerline_marker)
+        
+        else:
+            # IPS fallback - draw simple line
+            for i in range(NUM_LINE_POINTS):
+                t = i / (NUM_LINE_POINTS - 1)
+                point = ego_pos + t * (target_pos - ego_pos)
+                
+                m = Marker()
+                m.header.frame_id = FRAME_ID
+                m.header.stamp = stamp
+                m.ns = 'lidar_points'
+                m.id = i
+                m.type = Marker.SPHERE
+                m.action = Marker.ADD
+                m.pose.position.x = float(point[0])
+                m.pose.position.y = float(point[1])
+                m.pose.position.z = 0.1
+                m.pose.orientation.w = 1.0
+                m.scale.x = m.scale.y = m.scale.z = DOT_SIZE
+                
+                # Blue for IPS fallback
+                m.color.r, m.color.g, m.color.b = 0.0, 0.5, 1.0
+                m.color.a = 0.7
+                ma.markers.append(m)
         
         # Add text marker showing deviation
         text = Marker()
         text.header.frame_id = FRAME_ID
         text.header.stamp = stamp
-        text.ns = 'deviation'
-        text.id = 100
+        text.ns = 'lidar_points'
+        text.id = 199
         text.type = Marker.TEXT_VIEW_FACING
         text.action = Marker.ADD
         text.pose.position.x = float(target_pos[0])
@@ -492,6 +556,8 @@ class DynamicTargetTracker(Node):
         
         if self.using_ips_fallback:
             text.text = 'IPS Fallback'
+        elif self.target_points_ego is not None:
+            text.text = f'Dev: {self.current_deviation:.3f}m | {len(self.target_points_ego)} pts'
         else:
             text.text = f'Dev: {self.current_deviation:.3f}m'
         
