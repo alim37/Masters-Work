@@ -9,24 +9,39 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import LaserScan, Imu
 from geometry_msgs.msg import Quaternion, Point
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 
-ANGLE_WINDOW_DEG = 60.0
+# ============ CONFIGURATION ============
+LIDAR_TOPIC = '/autodrive/f1tenth_1/lidar'
+IPS_TOPIC = '/autodrive/f1tenth_1/ips'
+IMU_TOPIC = '/autodrive/f1tenth_1/imu'
+FRAME_ID = 'map'
+
+# LiDAR detection
+ANGLE_WINDOW_DEG = 90.0  # Wide cone to see target
 RANGE_MIN = 0.2
-RANGE_MAX = 15.0
-CLUSTER_MAX_GAP = 0.25
-CLUSTER_MIN_SIZE = 4
+RANGE_MAX = 3.0  # Only look close (target should be ~1.5m away)
 
-TRAJECTORY_MEMORY_SIZE = 500
-TRAJECTORY_LOOKAHEAD = 1.5  
+# Clustering
+CLUSTER_MAX_GAP = 0.30  # Max distance between points in same cluster
+CLUSTER_MIN_SIZE = 3    # Minimum points to be valid cluster
 
-LATERAL_DEV_THRESHOLD = 0.15
-TURN_RATE_SMOOTHING = 0.7
+# Target identification (KEY: distinguish car from walls)
+EXPECTED_TARGET_DISTANCE = 1.5  # meters - where we expect target to be
+DISTANCE_TOLERANCE = 0.8        # ± tolerance for target distance
+MAX_CLUSTER_SPAN = 0.8          # meters - max width/length of target cluster
+MIN_CLUSTER_SPAN = 0.15         # meters - min size to be a car
+COMPACTNESS_THRESHOLD = 2.5     # ratio of span to points (walls are elongated)
 
-MAX_POSITION_JUMP = 1.5
-DETECTION_LOSS_TIMEOUT = 1.0
-R_POS_STD = 0.20
-Q_ACCEL_STD = 1.5
+# Tracking
+MAX_POSITION_JUMP = 1.0  # Stricter - target can't jump far between frames
+TRACK_HISTORY_SIZE = 10  # Store last N target positions
+VELOCITY_SMOOTHING = 0.7 # Exponential smoothing for velocity
+
+# Visualization
+NUM_LINE_POINTS = 15
+DOT_SIZE = 0.12
+# =======================================
 
 def quat_to_yaw(q: Quaternion) -> float:
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -40,287 +55,325 @@ def rot2d(theta: float) -> np.ndarray:
 class TargetTrackerNode(Node):
     def __init__(self):
         super().__init__('target_tracker')
-
-        qos_lidar = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
-        self.scan_sub = self.create_subscription(LaserScan, '/autodrive/f1tenth_1/lidar', self.on_scan, qos_lidar)
-        self.ips_sub = self.create_subscription(Point, '/autodrive/f1tenth_1/imu', self.on_point, 10)
-        self.imu_sub = self.create_subscription(Imu, '/autodrive/f1tenth_1/ips', self.on_imu, 10)
-
-        self.marker_pub = self.create_publisher(Marker, 'target_marker', 10)
-
+        
+        # Subscriptions
+        qos_lidar = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT, 
+                               history=HistoryPolicy.KEEP_LAST)
+        self.scan_sub = self.create_subscription(LaserScan, LIDAR_TOPIC, self.on_scan, qos_lidar)
+        self.ips_sub = self.create_subscription(Point, IPS_TOPIC, self.on_point, 10)
+        self.imu_sub = self.create_subscription(Imu, IMU_TOPIC, self.on_imu, 10)
+        
+        # Publisher
+        self.marker_pub = self.create_publisher(MarkerArray, 'target_markers', 10)
+        
+        # Ego state
         self.have_ego_pose = False
         self.have_yaw = False
         self.x_e = self.y_e = self.yaw_e = 0.0
-        self.last_scan_stamp = None
-
-        self.ego_trajectory = deque(maxlen=TRAJECTORY_MEMORY_SIZE)
         
-        self.X = None
-        self.P = None
-        self.R = np.diag([R_POS_STD**2, R_POS_STD**2])
+        # Target tracking state
+        self.target_position = None      # Current target position (world frame)
+        self.target_velocity = np.array([0.0, 0.0])  # Velocity estimate
+        self.track_history = deque(maxlen=TRACK_HISTORY_SIZE)  # Recent positions
+        self.last_timestamp = None
         
-        self.estimated_turn_rate = 0.0
-        self.estimated_heading = None
-        self.is_turning = False
+        # Current detection for visualization
+        self.current_cluster_world = None
+        self.tracking_confidence = 0.0  # 0-1, how confident we are
         
-        self.using_ips_fallback = False
-        self.last_valid_lidar_time = None
-
-        self.get_logger().info('Target tracker ready (LiDAR + IPS fallback)')
+        self.get_logger().info('Robust LiDAR target tracker initialized')
 
     def on_point(self, msg: Point):
         self.x_e, self.y_e = msg.x, msg.y
         self.have_ego_pose = True
-        self.ego_trajectory.append((self.x_e, self.y_e))
 
     def on_imu(self, msg: Imu):
         self.yaw_e = quat_to_yaw(msg.orientation)
         self.have_yaw = True
 
-    def find_trajectory_point_ahead(self):
-        if len(self.ego_trajectory) < 10:
-            return None
+    def evaluate_cluster_as_target(self, cluster_points_ego):
+        """
+        Score a cluster based on how "car-like" it is.
+        Returns: (score, reason) where higher score = more likely to be target
+        """
+        if len(cluster_points_ego) < CLUSTER_MIN_SIZE:
+            return 0.0, "too_few_points"
         
-        traj = np.array(self.ego_trajectory)
-        ego_pos = np.array([self.x_e, self.y_e])
+        xs, ys = cluster_points_ego[:, 0], cluster_points_ego[:, 1]
         
-        dists = np.sqrt(np.sum((traj - ego_pos)**2, axis=1))
-        closest_idx = np.argmin(dists)
+        # Metric 1: Distance from ego (should be ~1.5m ahead)
+        centroid_range = math.hypot(np.mean(xs), np.mean(ys))
+        distance_error = abs(centroid_range - EXPECTED_TARGET_DISTANCE)
         
-        cumulative_dist = 0.0
-        for i in range(closest_idx, len(traj)):
-            if i > 0:
-                segment_dist = np.linalg.norm(traj[i] - traj[i-1])
-                cumulative_dist += segment_dist
-                
-                if cumulative_dist >= TRAJECTORY_LOOKAHEAD:
-                    return traj[i]
+        if distance_error > DISTANCE_TOLERANCE:
+            return 0.0, f"wrong_distance_{centroid_range:.2f}m"
         
-        if len(traj) > closest_idx + 1:
-            return traj[-1]
+        distance_score = 1.0 - (distance_error / DISTANCE_TOLERANCE)
         
-        return None
+        # Metric 2: Cluster compactness (car is compact, walls are elongated)
+        x_span = np.max(xs) - np.min(xs)
+        y_span = np.max(ys) - np.min(ys)
+        max_span = max(x_span, y_span)
+        
+        if max_span > MAX_CLUSTER_SPAN:
+            return 0.0, f"too_large_{max_span:.2f}m"
+        
+        if max_span < MIN_CLUSTER_SPAN:
+            return 0.0, f"too_small_{max_span:.2f}m"
+        
+        # Calculate compactness: spread per point (lower = more compact)
+        compactness = max_span / len(cluster_points_ego)
+        
+        if compactness > COMPACTNESS_THRESHOLD:
+            return 0.0, f"elongated_{compactness:.2f}"
+        
+        compactness_score = 1.0 - (compactness / COMPACTNESS_THRESHOLD)
+        
+        # Metric 3: Point density (car has moderate density, walls are sparse)
+        area = x_span * y_span if x_span > 0 and y_span > 0 else 0.01
+        density = len(cluster_points_ego) / area
+        
+        # Good density is 10-100 points/m²
+        if density < 5:
+            density_score = density / 5.0
+        elif density > 100:
+            density_score = 0.5
+        else:
+            density_score = 1.0
+        
+        # Metric 4: Temporal consistency (if we have tracking history)
+        temporal_score = 1.0
+        if self.target_position is not None:
+            # Transform centroid to world
+            Rw = rot2d(self.yaw_e)
+            centroid_ego = np.array([np.mean(xs), np.mean(ys)])
+            centroid_world = Rw @ centroid_ego + np.array([self.x_e, self.y_e])
+            
+            # Check distance from predicted position
+            predicted = self.predict_position(0.0)
+            distance_from_prediction = np.linalg.norm(centroid_world - predicted)
+            
+            if distance_from_prediction > MAX_POSITION_JUMP:
+                return 0.0, f"jumped_{distance_from_prediction:.2f}m"
+            
+            temporal_score = 1.0 - (distance_from_prediction / MAX_POSITION_JUMP)
+        
+        # Metric 5: Forward direction (target should be generally ahead, not behind)
+        centroid_angle = math.atan2(np.mean(ys), np.mean(xs))
+        angle_window_rad = math.radians(ANGLE_WINDOW_DEG)
+        
+        if abs(centroid_angle) > angle_window_rad:
+            return 0.0, f"wrong_angle_{math.degrees(centroid_angle):.1f}deg"
+        
+        angle_score = 1.0 - (abs(centroid_angle) / angle_window_rad)
+        
+        # Combined score (weighted average)
+        total_score = (
+            distance_score * 0.30 +      # Distance is very important
+            compactness_score * 0.25 +   # Shape matters
+            temporal_score * 0.25 +      # Consistency matters
+            density_score * 0.10 +       # Density helps
+            angle_score * 0.10           # Direction helps
+        )
+        
+        reason = f"dist={centroid_range:.2f}m,compact={compactness:.2f},temp={temporal_score:.2f}"
+        return total_score, reason
 
-    def detect_turn_from_cluster(self, xs, ys):
-        if len(xs) < 6:
-            return False, 0.0, 0.0
+    def predict_position(self, dt):
+        """Predict target position after dt seconds using velocity."""
+        if self.target_position is None:
+            return np.array([self.x_e + EXPECTED_TARGET_DISTANCE, self.y_e])
         
-        cx, cy = np.mean(xs), np.mean(ys)
-        heading = math.atan2(cy, cx)
-        cos_h, sin_h = math.cos(-heading), math.sin(-heading)
-        
-        ys_rot = [(xs[i]-cx)*sin_h + (ys[i]-cy)*cos_h for i in range(len(xs))]
-        lateral_std = np.std(ys_rot)
-        lateral_mean = np.mean(ys_rot)
-        
-        is_turning = lateral_std > LATERAL_DEV_THRESHOLD
-        turn_dir = 1.0 if lateral_mean > 0.02 else (-1.0 if lateral_mean < -0.02 else 0.0)
-        
-        return is_turning, lateral_std, turn_dir
+        predicted = self.target_position + self.target_velocity * dt
+        return predicted
 
-    def predict_target_position(self, dt):
-        if self.X is None:
-            return (0.0, 0.0)
+    def update_target_state(self, centroid_world, timestamp):
+        """Update target position and velocity estimates."""
+        if self.target_position is None:
+            # First detection
+            self.target_position = centroid_world
+            self.track_history.append(centroid_world)
+            self.last_timestamp = timestamp
+            return
         
-        x, y, vx, vy = float(self.X[0,0]), float(self.X[1,0]), float(self.X[2,0]), float(self.X[3,0])
-        speed = math.hypot(vx, vy)
-        heading = self.estimated_heading if self.estimated_heading else math.atan2(vy, vx)
+        # Calculate dt
+        if self.last_timestamp is not None:
+            dt = (timestamp.sec + timestamp.nanosec * 1e-9) - \
+                 (self.last_timestamp.sec + self.last_timestamp.nanosec * 1e-9)
+            dt = max(0.01, min(dt, 0.5))  # Clamp to reasonable range
+        else:
+            dt = 0.05
         
-        if self.is_turning and abs(self.estimated_turn_rate) > 0.05:
-            omega = self.estimated_turn_rate
-            if abs(omega) > 1e-3:
-                R = speed / omega
-                dtheta = omega * dt
-                px = x + R * (math.sin(heading + dtheta) - math.sin(heading))
-                py = y + R * (-math.cos(heading + dtheta) + math.cos(heading))
-                return (px, py)
+        # Update velocity with exponential smoothing
+        measured_velocity = (centroid_world - self.target_position) / dt
+        alpha = VELOCITY_SMOOTHING
+        self.target_velocity = alpha * self.target_velocity + (1 - alpha) * measured_velocity
         
-        return (x + vx*dt, y + vy*dt)
-
-    def validate_lidar_detection(self, detection_world):
-        if self.X is None:
-            return True
+        # Update position
+        self.target_position = centroid_world
+        self.track_history.append(centroid_world)
+        self.last_timestamp = timestamp
         
-        pred_pos = self.predict_target_position(0.0)
-        dist = math.hypot(detection_world[0] - pred_pos[0], detection_world[1] - pred_pos[1])
-        
-        return dist <= MAX_POSITION_JUMP
+        # Increase confidence
+        self.tracking_confidence = min(1.0, self.tracking_confidence + 0.2)
 
     def on_scan(self, scan: LaserScan):
         if not self.have_ego_pose or not self.have_yaw:
             return
-
+        
+        # Extract points in wide cone
         n = len(scan.ranges)
         angle_win_rad = math.radians(ANGLE_WINDOW_DEG)
         angles = scan.angle_min + np.arange(n) * scan.angle_increment
         ranges = np.array(scan.ranges, dtype=float)
         
+        # Filter to forward cone and valid range
         mask = ((angles >= -angle_win_rad) & (angles <= angle_win_rad) & 
                 (ranges > RANGE_MIN) & (ranges < RANGE_MAX))
         
-        lidar_has_detection = np.any(mask)
-        
-        if lidar_has_detection:
-            a, r = angles[mask], ranges[mask]
-            xs, ys = r * np.cos(a), r * np.sin(a)
-            
-            order = np.argsort(a)
-            xs, ys = xs[order], ys[order]
-            
-            clusters = []
-            current = [0]
-            for i in range(1, len(xs)):
-                gap = math.hypot(xs[i]-xs[i-1], ys[i]-ys[i-1])
-                if gap <= CLUSTER_MAX_GAP:
-                    current.append(i)
-                else:
-                    if len(current) >= CLUSTER_MIN_SIZE:
-                        clusters.append(current)
-                    current = [i]
-            if len(current) >= CLUSTER_MIN_SIZE:
-                clusters.append(current)
-            
-            if clusters:
-                best_idx = min(clusters, key=lambda idxs: np.mean(np.hypot(xs[idxs], ys[idxs])))
-                cx_ego, cy_ego = float(np.mean(xs[best_idx])), float(np.mean(ys[best_idx]))
-                
-                is_turning, lat_dev, turn_dir = self.detect_turn_from_cluster(xs[best_idx], ys[best_idx])
-                self.is_turning = is_turning
-                if is_turning:
-                    speed = math.hypot(self.X[2,0], self.X[3,0]) if self.X is not None else 1.0
-                    range_to_target = math.hypot(cx_ego, cy_ego)
-                    raw_turn_rate = turn_dir * lat_dev * 3.0 * speed / max(range_to_target, 0.5)
-                    self.estimated_turn_rate = (TURN_RATE_SMOOTHING * self.estimated_turn_rate + (1-TURN_RATE_SMOOTHING) * np.clip(raw_turn_rate, -2.0, 2.0))
-                else:
-                    self.estimated_turn_rate *= 0.8
-                
-                Rw = rot2d(self.yaw_e)
-                c_world = Rw @ np.array([cx_ego, cy_ego]) + np.array([self.x_e, self.y_e])
-                
-                if self.validate_lidar_detection(c_world):
-                    self.ekf_update(scan.header.stamp, c_world.reshape(2,1))
-                    self.using_ips_fallback = False
-                    self.last_valid_lidar_time = self.get_clock().now()
-                    self.last_scan_stamp = scan.header.stamp
-                    self.publish_marker(scan.header.stamp, detection_valid=True, using_ips=False)
-                    self.get_logger().info('LiDAR tracking', throttle_duration_sec=1.0)
-                    return
-                else:
-                    self.get_logger().warn('LiDAR invalid -> IPS fallback', throttle_duration_sec=0.5)
-        
-        ips_target = self.find_trajectory_point_ahead()
-        
-        if ips_target is not None:
-            self.ekf_update(scan.header.stamp, np.array([[ips_target[0]], [ips_target[1]]]))
-            self.using_ips_fallback = True
-            self.last_scan_stamp = scan.header.stamp
-            self.publish_marker(scan.header.stamp, detection_valid=True, using_ips=True)
-            self.get_logger().info('IPS fallback tracking', throttle_duration_sec=1.0)
-        else:
-            self.predict_only(scan.header.stamp)
-            self.publish_marker(scan.header.stamp, detection_valid=False, using_ips=False)
-
-    def ekf_update(self, stamp, z):
-        now = self.get_clock().now()
-        
-        if self.X is None:
-            self.X = np.array([[z[0,0]], [z[1,0]], [0.0], [0.0]])
-            self.P = np.diag([1.0, 1.0, 4.0, 4.0])
-            self.last_valid_lidar_time = now
+        if not np.any(mask):
+            self.handle_lost_target()
             return
         
-        dt = 0.05
-        if self.last_scan_stamp:
-            dt = max(1e-3, (stamp.sec + stamp.nanosec*1e-9) - (self.last_scan_stamp.sec + self.last_scan_stamp.nanosec*1e-9))
+        # Convert to cartesian (ego frame)
+        a, r = angles[mask], ranges[mask]
+        xs, ys = r * np.cos(a), r * np.sin(a)
         
-        self.ekf_predict(dt)
+        # Sort by angle for clustering
+        order = np.argsort(a)
+        xs, ys = xs[order], ys[order]
         
-        R = self.R * (5.0 if self.using_ips_fallback else 1.0)
-        
-        H = np.array([[1,0,0,0], [0,1,0,0]], dtype=float)
-        y = z - H @ self.X
-        S = H @ self.P @ H.T + R
-        K = self.P @ H.T @ np.linalg.inv(S)
-        self.X = self.X + K @ y
-        self.P = (np.eye(4) - K @ H) @ self.P
-        
-        vx, vy = float(self.X[2,0]), float(self.X[3,0])
-        if math.hypot(vx, vy) > 0.1:
-            new_heading = math.atan2(vy, vx)
-            if self.estimated_heading is None:
-                self.estimated_heading = new_heading
+        # Cluster points
+        clusters = []
+        current = [0]
+        for i in range(1, len(xs)):
+            gap = math.hypot(xs[i] - xs[i-1], ys[i] - ys[i-1])
+            if gap <= CLUSTER_MAX_GAP:
+                current.append(i)
             else:
-                diff = new_heading - self.estimated_heading
-                while diff > math.pi: diff -= 2*math.pi
-                while diff < -math.pi: diff += 2*math.pi
-                self.estimated_heading += 0.3 * diff
-
-    def ekf_predict(self, dt):
-        if self.X is None:
+                if len(current) >= CLUSTER_MIN_SIZE:
+                    clusters.append(current)
+                current = [i]
+        if len(current) >= CLUSTER_MIN_SIZE:
+            clusters.append(current)
+        
+        if not clusters:
+            self.handle_lost_target()
             return
         
-        F = np.array([[1,0,dt,0], [0,1,0,dt], [0,0,1,0], [0,0,0,1]], dtype=float)
-        q = Q_ACCEL_STD
-        Q = np.array([[0.25*dt**4*q**2, 0, 0.5*dt**3*q**2, 0],
-                      [0, 0.25*dt**4*q**2, 0, 0.5*dt**3*q**2],
-                      [0.5*dt**3*q**2, 0, dt**2*q**2, 0],
-                      [0, 0.5*dt**3*q**2, 0, dt**2*q**2]], dtype=float)
+        # Evaluate each cluster and pick best
+        best_cluster = None
+        best_score = 0.0
+        best_reason = ""
         
-        self.X = F @ self.X
-        self.P = F @ self.P @ F.T + Q
-
-    def predict_only(self, stamp):
-        if self.X is None:
+        for cluster_indices in clusters:
+            cluster_points = np.column_stack([xs[cluster_indices], ys[cluster_indices]])
+            score, reason = self.evaluate_cluster_as_target(cluster_points)
+            
+            if score > best_score:
+                best_score = score
+                best_cluster = cluster_indices
+                best_reason = reason
+        
+        if best_cluster is None or best_score < 0.3:  # Minimum confidence threshold
+            self.get_logger().warn(f'No good target found. Best score: {best_score:.2f}', 
+                                  throttle_duration_sec=0.5)
+            self.handle_lost_target()
             return
         
-        dt = 0.05
-        if self.last_scan_stamp:
-            dt = max(1e-3, (stamp.sec + stamp.nanosec*1e-9) - 
-                          (self.last_scan_stamp.sec + self.last_scan_stamp.nanosec*1e-9))
+        # Found target!
+        cluster_xs = xs[best_cluster]
+        cluster_ys = ys[best_cluster]
         
-        self.ekf_predict(dt)
+        # Transform to world frame
+        Rw = rot2d(self.yaw_e)
+        cluster_points_ego = np.column_stack([cluster_xs, cluster_ys])
+        cluster_points_world = (Rw @ cluster_points_ego.T).T + np.array([self.x_e, self.y_e])
         
-        now = self.get_clock().now()
-        if self.last_valid_lidar_time:
-            dt_loss = (now.nanoseconds - self.last_valid_lidar_time.nanoseconds) * 1e-9
-            if dt_loss > DETECTION_LOSS_TIMEOUT:
-                self.get_logger().warn('Target lost - resetting')
-                self.X = None
-                self.estimated_heading = None
-                self.estimated_turn_rate = 0.0
-                return
+        centroid_ego = np.array([np.mean(cluster_xs), np.mean(cluster_ys)])
+        centroid_world = Rw @ centroid_ego + np.array([self.x_e, self.y_e])
+        
+        # Update tracking state
+        self.update_target_state(centroid_world, scan.header.stamp)
+        self.current_cluster_world = cluster_points_world
+        
+        self.get_logger().info(
+            f'Target found: score={best_score:.2f}, {best_reason}, '
+            f'{len(best_cluster)} pts, conf={self.tracking_confidence:.2f}',
+            throttle_duration_sec=0.5
+        )
+        
+        self.publish_visualization(scan.header.stamp)
 
-    def publish_marker(self, stamp, detection_valid, using_ips):
-        if self.X is None:
-            return
+    def handle_lost_target(self):
+        """Called when no valid target detected."""
+        # Decay confidence
+        self.tracking_confidence *= 0.8
         
-        m = Marker()
-        m.header.frame_id = 'map'
-        m.header.stamp = stamp
-        m.ns = 'target'
-        m.id = 0
-        m.type = Marker.SPHERE
-        m.action = Marker.ADD
-        m.pose.position.x = float(self.X[0,0])
-        m.pose.position.y = float(self.X[1,0])
-        m.pose.position.z = 0.12
-        m.pose.orientation.w = 1.0
-        m.scale.x = m.scale.y = m.scale.z = 0.26
-        
-        if not detection_valid:
-            m.color.r, m.color.g, m.color.b = 1.0, 0.0, 0.0
-            m.color.a = 0.5
-        elif using_ips:
-            m.color.r, m.color.g, m.color.b = 0.0, 0.5, 1.0
-            m.color.a = 0.8
-        elif self.is_turning:
-            m.color.r, m.color.g, m.color.b = 1.0, 1.0, 0.0
-            m.color.a = 1.0
+        if self.tracking_confidence < 0.1:
+            # Lost track completely
+            self.get_logger().warn('Target lost - resetting tracker')
+            self.target_position = None
+            self.target_velocity = np.array([0.0, 0.0])
+            self.current_cluster_world = None
+            self.track_history.clear()
         else:
-            m.color.r, m.color.g, m.color.b = 0.0, 1.0, 0.0
-            m.color.a = 1.0
+            # Predict forward
+            if self.last_timestamp is not None:
+                self.target_position = self.predict_position(0.05)
         
-        self.marker_pub.publish(m)
+        self.publish_visualization(self.get_clock().now().to_msg())
+
+    def publish_visualization(self, stamp):
+        """Visualize target as line of dots."""
+        ma = MarkerArray()
+        
+        if self.target_position is None:
+            # Clear markers
+            for i in range(NUM_LINE_POINTS):
+                m = Marker()
+                m.header.frame_id = FRAME_ID
+                m.header.stamp = stamp
+                m.ns = 'target'
+                m.id = i
+                m.action = Marker.DELETE
+                ma.markers.append(m)
+            self.marker_pub.publish(ma)
+            return
+        
+        # Create line from ego to target
+        ego_pos = np.array([self.x_e, self.y_e])
+        target_pos = self.target_position
+        
+        for i in range(NUM_LINE_POINTS):
+            t = i / (NUM_LINE_POINTS - 1)
+            point = ego_pos + t * (target_pos - ego_pos)
+            
+            m = Marker()
+            m.header.frame_id = FRAME_ID
+            m.header.stamp = stamp
+            m.ns = 'target'
+            m.id = i
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = float(point[0])
+            m.pose.position.y = float(point[1])
+            m.pose.position.z = 0.1
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = DOT_SIZE
+            
+            # Color based on confidence
+            if self.tracking_confidence > 0.7:
+                m.color.r, m.color.g, m.color.b = 0.0, 1.0, 0.0  # Green - confident
+            elif self.tracking_confidence > 0.3:
+                m.color.r, m.color.g, m.color.b = 1.0, 1.0, 0.0  # Yellow - uncertain
+            else:
+                m.color.r, m.color.g, m.color.b = 1.0, 0.0, 0.0  # Red - lost
+            
+            m.color.a = self.tracking_confidence
+            ma.markers.append(m)
+        
+        self.marker_pub.publish(ma)
 
 def main():
     rclpy.init()
