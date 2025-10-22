@@ -39,6 +39,9 @@ DEVIATION_THRESHOLD = 0.08
 DEVIATION_HISTORY_SIZE = 5
 MIN_POINTS_FOR_DEVIATION = 5
 
+STEERING_GAIN = 2.0
+MAX_STEERING_ANGLE = 0.52
+
 NUM_LINE_POINTS = 15
 DOT_SIZE = 0.12
 
@@ -62,6 +65,7 @@ class DynamicTargetTracker(Node):
         self.imu_sub = self.create_subscription(Imu, IMU_TOPIC, self.on_imu, 10)
         
         self.marker_pub = self.create_publisher(MarkerArray, 'target_markers', 10)
+        self.steering_viz_pub = self.create_publisher(Marker, 'steering_visualization', 10)
         
         self.have_ego_pose = False
         self.have_yaw = False
@@ -77,6 +81,8 @@ class DynamicTargetTracker(Node):
         self.deviation_history = deque(maxlen=DEVIATION_HISTORY_SIZE)
         self.current_deviation = 0.0
         self.deviation_direction = 0.0
+        
+        self.computed_steering = 0.0
         
         self.tracking_confidence = 0.0
         
@@ -277,6 +283,8 @@ class DynamicTargetTracker(Node):
         self.current_deviation = np.mean(self.deviation_history)
         self.deviation_direction = dev_dir
         
+        self.compute_steering()
+        
         self.publish_visualization(scan.header.stamp)
 
     def handle_no_detection(self):
@@ -285,7 +293,16 @@ class DynamicTargetTracker(Node):
             self.target_position = None
             self.target_points_ego = None
             self.current_deviation = 0.0
+            self.computed_steering = 0.0
         self.publish_visualization(self.get_clock().now().to_msg())
+
+    def compute_steering(self):
+        if self.current_deviation > DEVIATION_THRESHOLD:
+            deviation_magnitude = self.current_deviation - DEVIATION_THRESHOLD
+            steering_command = STEERING_GAIN * deviation_magnitude * self.deviation_direction
+            self.computed_steering = np.clip(steering_command, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE)
+        else:
+            self.computed_steering = 0.0
 
     def publish_visualization(self, stamp):
         ma = MarkerArray()
@@ -351,6 +368,60 @@ class DynamicTargetTracker(Node):
             text.text = f'Dev: {self.current_deviation:.3f}m'
         
         ma.markers.append(text)
+        
+        steering_arrow = Marker()
+        steering_arrow.header.frame_id = FRAME_ID
+        steering_arrow.header.stamp = stamp
+        steering_arrow.ns = 'target_line'
+        steering_arrow.id = 101
+        steering_arrow.type = Marker.ARROW
+        steering_arrow.action = Marker.ADD
+        
+        arrow_length = 1.0
+        arrow_angle = self.computed_steering
+        
+        start_point = Point()
+        start_point.x = self.x_e
+        start_point.y = self.y_e
+        start_point.z = 0.3
+        
+        end_point = Point()
+        end_point.x = self.x_e + arrow_length * math.cos(self.yaw_e + arrow_angle)
+        end_point.y = self.y_e + arrow_length * math.sin(self.yaw_e + arrow_angle)
+        end_point.z = 0.3
+        
+        steering_arrow.points = [start_point, end_point]
+        steering_arrow.scale.x = 0.1
+        steering_arrow.scale.y = 0.2
+        steering_arrow.scale.z = 0.2
+        
+        steering_magnitude = abs(self.computed_steering) / MAX_STEERING_ANGLE
+        steering_arrow.color.r = steering_magnitude
+        steering_arrow.color.g = 1.0 - steering_magnitude
+        steering_arrow.color.b = 0.0
+        steering_arrow.color.a = 1.0
+        
+        ma.markers.append(steering_arrow)
+        
+        steering_text = Marker()
+        steering_text.header.frame_id = FRAME_ID
+        steering_text.header.stamp = stamp
+        steering_text.ns = 'target_line'
+        steering_text.id = 102
+        steering_text.type = Marker.TEXT_VIEW_FACING
+        steering_text.action = Marker.ADD
+        steering_text.pose.position.x = self.x_e
+        steering_text.pose.position.y = self.y_e
+        steering_text.pose.position.z = 0.8
+        steering_text.scale.z = 0.25
+        steering_text.color.r = 1.0
+        steering_text.color.g = 1.0
+        steering_text.color.b = 0.0
+        steering_text.color.a = 1.0
+        steering_text.text = f'Steering: {math.degrees(self.computed_steering):.1f}°'
+        
+        ma.markers.append(steering_text)
+        
         self.marker_pub.publish(ma)
 
 def main():
