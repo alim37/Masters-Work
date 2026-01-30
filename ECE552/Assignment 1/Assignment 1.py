@@ -192,7 +192,7 @@ for p in paths:
     assert os.path.exists(p), p
     f = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
     assert f is not None, p
-    g = ahe(f, tile_h=128, tile_w=128, ksize=5)
+    g = ahe(f, tile_h=512, tile_w=512, ksize=5)
     n = np.bincount(f.ravel(), minlength=256)
     ng = np.bincount(g.ravel(), minlength=256)
     plt.figure(figsize=(10,4))
@@ -210,7 +210,7 @@ for p in paths2:
     R, G, B = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
     I = (R+G+B)/3.0
     Iu = np.rint(I).clip(0,255).astype(np.uint8)
-    Ip_u8 = ahe(Iu, tile_h=128, tile_w=128, ksize=5)
+    Ip_u8 = ahe(Iu, tile_h=512, tile_w=512, ksize=5)
     Ip = Ip_u8.astype(np.float32)
     eps = 1e-6
     ratio = Ip / (I + eps)
@@ -244,7 +244,7 @@ for p in paths2:
     th = np.arccos(np.clip(num/den, -1, 1))
     H = np.where(B<=G, th, 2*np.pi - th)
     Iu = np.rint(I).clip(0,255).astype(np.uint8)
-    Ii = ahe(Iu, tile_h=128, tile_w=128, ksize=5).astype(np.float32)
+    Ii = ahe(Iu, tile_h=512, tile_w=512, ksize=5).astype(np.float32)
     h = H
     s = np.clip(S,0,1)
     R2 = np.zeros_like(Ii)
@@ -290,7 +290,7 @@ for p in paths2:
     H = hsv[:,:,0]
     S = hsv[:,:,1]
     V = hsv[:,:,2]
-    Vp = ahe(V, tile_h=128, tile_w=128, ksize=5)
+    Vp = ahe(V, tile_h=512, tile_w=512, ksize=5)
     out = cv2.cvtColor(np.dstack([H, S, Vp]).astype(np.uint8), cv2.COLOR_HSV2RGB)
     plt.figure(figsize=(11,6))
     plt.subplot(2,2,1); plt.imshow(rgb); plt.axis("off"); plt.title("Original")
