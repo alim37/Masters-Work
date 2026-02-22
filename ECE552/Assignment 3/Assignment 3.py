@@ -40,7 +40,7 @@ def load_three_bmp_images(folder="."):
     return images, names
 
 
-def harris_corner_detection(gray, gaussian_ksize=5, gaussian_sigma=1.0, window_size=3, k=0.04, r_threshold_ratio=0.01, lambda_threshold=1000.0, border_ignore_pixels=0):
+def harris_corner_detection(gray, gaussian_ksize=5, gaussian_sigma=1.0, window_size=3, k=0.04, r_threshold_ratio=0.01, lambda_threshold_ratio=0.01, border_ignore_pixels=0):
     
     gray_f = gray.astype(np.float32)
 
@@ -73,7 +73,7 @@ def harris_corner_detection(gray, gaussian_ksize=5, gaussian_sigma=1.0, window_s
 
     # 6) Thresholds (tunable).
     r_thresh = r_threshold_ratio * float(np.max(r))
-    lambda_thresh = float(lambda_threshold)
+    lambda_thresh = lambda_threshold_ratio * float(np.max(lambda1))
 
     # 7) If-else style logic (vectorized): corner / edge / flat
     corner_mask = (r > r_thresh) & (lambda1 > lambda_thresh) & (lambda2 > lambda_thresh)
@@ -203,7 +203,7 @@ def main():
     GAUSSIAN_SIGMA = 1.2
     HARRIS_K = 0.04
     R_THRESHOLD_RATIO = 0.01
-    LAMBDA_THRESHOLD = 1000.0
+    LAMBDA_THRESHOLD_RATIO = 0.01
     # Increase this value if image-frame corners still appear.
     BORDER_IGNORE_PIXELS = 10
     K_CLUSTERS = 15
@@ -224,7 +224,7 @@ def main():
             window_size=WINDOW_SIZE,
             k=HARRIS_K,
             r_threshold_ratio=R_THRESHOLD_RATIO,
-            lambda_threshold=LAMBDA_THRESHOLD,
+            lambda_threshold_ratio=LAMBDA_THRESHOLD_RATIO,
             border_ignore_pixels=BORDER_IGNORE_PIXELS,
         )
         corners_overlay = draw_corners_overlay(img_bgr, hres.corners_xy, color=(0, 0, 255), radius=2)
