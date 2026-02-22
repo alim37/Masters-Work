@@ -1,46 +1,20 @@
 import os
-from dataclasses import dataclass
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-@dataclass
-class HarrisResult:
-    corners_xy: np.ndarray
-    corner_mask: np.ndarray
-    edge_mask: np.ndarray
-    flat_mask: np.ndarray
-    response_r: np.ndarray
-    lambda1: np.ndarray
-    lambda2: np.ndarray
-
-
-def load_three_bmp_images(folder="."):
-    one_object_name = "plane.bmp"
-    multiple_objects_name = "cars.bmp"
-    no_objects_name = "castle.bmp"
-
-    chosen = [
-        os.path.join(folder, one_object_name),
-        os.path.join(folder, multiple_objects_name),
-        os.path.join(folder, no_objects_name),
-    ]
-    images = []
-    names = []
-    for p in chosen:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Image not found: {p}")
-        img_bgr = cv2.imread(p, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            raise ValueError(f"Could not read image: {p}")
-        images.append(img_bgr)
-        names.append(os.path.basename(p))
-    return images, names
-
-
-def harris_corner_detection(gray, gaussian_ksize=5, gaussian_sigma=1.0, window_size=3, k=0.04, r_threshold_ratio=0.01, lambda_threshold=0.001, border_ignore_pixels=0):
+def harris_corner_detection(
+    gray,
+    gaussian_ksize=5,
+    gaussian_sigma=1.0,
+    window_size=3,
+    k=0.04,
+    r_threshold_ratio=0.01,
+    lambda_threshold=0.001,
+    border_ignore_pixels=0,
+):
     gray_f = gray.astype(np.float32) / 255.0
     smoothed = cv2.GaussianBlur(gray_f, (gaussian_ksize, gaussian_ksize), gaussian_sigma)
 
@@ -65,11 +39,9 @@ def harris_corner_detection(gray, gaussian_ksize=5, gaussian_sigma=1.0, window_s
     r_thresh = r_threshold_ratio * float(np.max(r))
     lambda_thresh = float(lambda_threshold)
 
-    # 7) If-else style logic (vectorized): corner / edge / flat
     corner_mask = (r > r_thresh) & (lambda1 > lambda_thresh) & (lambda2 > lambda_thresh)
     edge_mask = (lambda1 > lambda_thresh) & (lambda2 <= lambda_thresh)
 
-    # Ignore border pixels (common source of false corners due to padding).
     if border_ignore_pixels > 0:
         h, w = gray.shape[:2]
         valid = np.zeros((h, w), dtype=bool)
@@ -78,95 +50,95 @@ def harris_corner_detection(gray, gaussian_ksize=5, gaussian_sigma=1.0, window_s
         edge_mask = edge_mask & valid
 
     flat_mask = ~(corner_mask | edge_mask)
-
     ys, xs = np.where(corner_mask)
     corners_xy = np.column_stack((xs, ys)).astype(np.int32)
 
-    return HarrisResult(
-        corners_xy=corners_xy,
-        corner_mask=corner_mask,
-        edge_mask=edge_mask,
-        flat_mask=flat_mask,
-        response_r=r,
-        lambda1=lambda1,
-        lambda2=lambda2,
-    )
+    return {
+        "corners_xy": corners_xy,
+        "corner_mask": corner_mask,
+        "edge_mask": edge_mask,
+        "flat_mask": flat_mask,
+        "response_r": r,
+        "lambda1": lambda1,
+        "lambda2": lambda2,
+    }
 
 
-def kmeans_points(points_xy, k_clusters=15, max_iters=100, tol=1e-3, random_seed=42):
-    if points_xy.shape[0] == 0:
-        return np.array([], dtype=np.int32), np.zeros((0, 2), dtype=np.float32)
-
+def kmeans_cluster(
+    points_xy,
+    k_clusters=15,
+    max_iters=100,
+    tol=1e-3,
+    random_seed=42,
+    elbow_k_min=None,
+    elbow_k_max=None,
+    elbow_n_init=3,
+):
+    points_xy = np.asarray(points_xy, dtype=np.int32)
     n_points = points_xy.shape[0]
-    k_use = int(min(k_clusters, n_points))
-    rng = np.random.default_rng(random_seed)
 
-    # 1) Randomly choose K points as initial cluster means.
-    init_idx = rng.choice(n_points, size=k_use, replace=False)
-    centers = points_xy[init_idx].astype(np.float32)
-    labels = np.zeros(n_points, dtype=np.int32)
+    if n_points == 0:
+        return {"labels": np.array([], dtype=np.int32), "centers": np.zeros((0, 2), dtype=np.float32)}
 
-    for _ in range(max_iters):
-        # 2) Euclidean distance to every cluster mean.
-        diff = points_xy[:, None, :].astype(np.float32) - centers[None, :, :]
-        dists = np.sum(diff * diff, axis=2)
+    if elbow_k_min is None or elbow_k_max is None:
+        k_use = int(min(max(1, k_clusters), n_points))
+        rng = np.random.default_rng(random_seed)
+        init_idx = rng.choice(n_points, size=k_use, replace=False)
+        centers = points_xy[init_idx].astype(np.float32)
+        labels = np.zeros(n_points, dtype=np.int32)
 
-        # 3) Assign each point to nearest cluster mean.
-        new_labels = np.argmin(dists, axis=1).astype(np.int32)
+        for _ in range(max_iters):
+            diff = points_xy[:, None, :].astype(np.float32) - centers[None, :, :]
+            dists = np.sum(diff * diff, axis=2)
+            new_labels = np.argmin(dists, axis=1).astype(np.int32)
 
-        # 4/5) Recompute means.
-        new_centers = centers.copy()
-        for c in range(k_use):
-            cluster_pts = points_xy[new_labels == c]
-            if cluster_pts.shape[0] > 0:
-                new_centers[c] = np.mean(cluster_pts, axis=0)
-            else:
-                new_centers[c] = points_xy[rng.integers(0, n_points)]
+            new_centers = centers.copy()
+            for c in range(k_use):
+                cluster_pts = points_xy[new_labels == c]
+                if cluster_pts.shape[0] > 0:
+                    new_centers[c] = np.mean(cluster_pts, axis=0)
+                else:
+                    new_centers[c] = points_xy[rng.integers(0, n_points)]
 
-        # 6) Repeat until means are stable.
-        shift = np.linalg.norm(new_centers - centers, axis=1).max()
-        labels = new_labels
-        centers = new_centers
-        if shift < tol:
-            break
+            shift = np.linalg.norm(new_centers - centers, axis=1).max()
+            labels = new_labels
+            centers = new_centers
+            if shift < tol:
+                break
 
-    return labels, centers
+        return {"labels": labels, "centers": centers}
 
-
-def compute_ssd(points_xy, labels, centers):
-    if points_xy.shape[0] == 0 or centers.shape[0] == 0:
-        return float("nan")
-    diff = points_xy.astype(np.float32) - centers[labels]
-    return float(np.sum(diff * diff))
-
-
-def compute_elbow_curve(points_xy, k_min=1, k_max=20, n_init=3, max_iters=100, tol=1e-3):
-    if points_xy.shape[0] == 0:
-        return [], []
-
-    k_low = max(1, int(k_min))
-    k_high = min(int(k_max), int(points_xy.shape[0]))
+    k_low = max(1, int(elbow_k_min))
+    k_high = min(int(elbow_k_max), n_points)
     if k_low > k_high:
-        return [], []
+        return {"ks": [], "ssd_values": []}
 
     ks = []
     ssd_values = []
     for k in range(k_low, k_high + 1):
         best_ssd = float("inf")
-        for trial in range(n_init):
-            labels, centers = kmeans_points(
+        for trial in range(elbow_n_init):
+            fit = kmeans_cluster(
                 points_xy,
                 k_clusters=k,
                 max_iters=max_iters,
                 tol=tol,
-                random_seed=42 + trial,
+                random_seed=random_seed + trial,
             )
-            ssd = compute_ssd(points_xy, labels, centers)
+            labels = fit["labels"]
+            centers = fit["centers"]
+            if centers.shape[0] == 0:
+                ssd = float("nan")
+            else:
+                diff = points_xy.astype(np.float32) - centers[labels]
+                ssd = float(np.sum(diff * diff))
             if ssd < best_ssd:
                 best_ssd = ssd
+
         ks.append(k)
         ssd_values.append(best_ssd)
-    return ks, ssd_values
+
+    return {"ks": ks, "ssd_values": ssd_values}
 
 
 def draw_corners_overlay(img_bgr, corners_xy, color=(0, 0, 255), radius=2):
@@ -205,84 +177,68 @@ def draw_cluster_bboxes(img_bgr, points_xy, labels, k_clusters, min_points_for_b
     return out
 
 
-def plot_and_save(images_rgb, titles, out_path):
-    n = len(images_rgb)
+def plot_and_save(items, titles, out_path, mode="image"):
+    n = len(items)
     fig, axes = plt.subplots(1, n, figsize=(6 * n, 5))
     if n == 1:
         axes = [axes]
-    for ax, im, title in zip(axes, images_rgb, titles):
-        ax.imshow(im)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-        # Place image metadata underneath each image.
-        ax.set_xlabel(title, fontsize=10, labelpad=8)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
 
-
-def plot_elbow_and_save(elbow_data, out_path):
-    n = len(elbow_data)
-    fig, axes = plt.subplots(1, n, figsize=(6 * n, 4.5))
-    if n == 1:
-        axes = [axes]
-
-    for ax, (name, ks, ssd_vals) in zip(axes, elbow_data):
-        if len(ks) == 0:
-            ax.text(0.5, 0.5, "No corners", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(name)
+    for ax, item, title in zip(axes, items, titles):
+        if mode == "image":
+            ax.imshow(item)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            ax.set_xlabel(title, fontsize=10, labelpad=8)
+        else:
+            ks, ssd_vals = item
+            if len(ks) == 0:
+                ax.text(0.5, 0.5, "No corners", ha="center", va="center", transform=ax.transAxes)
+            else:
+                ax.plot(ks, ssd_vals, marker="o", linewidth=1.8)
+                ax.grid(True, alpha=0.3)
+            ax.set_title(title)
             ax.set_xlabel("K")
             ax.set_ylabel("SSD")
-            continue
-        ax.plot(ks, ssd_vals, marker="o", linewidth=1.8)
-        ax.set_title(name)
-        ax.set_xlabel("K")
-        ax.set_ylabel("SSD")
-        ax.grid(True, alpha=0.3)
 
-    fig.suptitle("Elbow Method on Harris Corners", fontsize=14)
+    if mode == "elbow":
+        fig.suptitle("Elbow Method on Harris Corners", fontsize=14)
+
     plt.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
 def main():
-    images_bgr, names = load_three_bmp_images(".")
+    one_object_name = "plane.bmp"
+    multiple_objects_name = "cars.bmp"
+    no_objects_name = "castle.bmp"
+
+    names = [one_object_name, multiple_objects_name, no_objects_name]
+    images_bgr = [cv2.imread(os.path.join(".", n), cv2.IMREAD_COLOR) for n in names]
 
     WINDOW_SIZE = 5
     GAUSSIAN_KSIZE = 5
     GAUSSIAN_SIGMA = 1.2
     HARRIS_K = 0.04
     R_THRESHOLD_RATIO = 0.01
-    LAMBDA_THRESHOLDS = [0.2, 0.2, 0.05] # adjust per image
+    LAMBDA_THRESHOLDS = [0.2, 0.2, 0.05]  # adjust per image
     BORDER_IGNORE_PIXELS = 10
-    # Set one K per image (same order as load_three_bmp_images()).
-    K_CLUSTERS_LIST = [10, 7, 15]
+    K_CLUSTERS_LIST = [10, 7, 15] # set per
     ELBOW_K_MIN = 1
     ELBOW_K_MAX = 20
     ELBOW_N_INIT = 3
-
-    if len(LAMBDA_THRESHOLDS) != len(images_bgr):
-        raise ValueError(
-            f"LAMBDA_THRESHOLDS must have {len(images_bgr)} values, got {len(LAMBDA_THRESHOLDS)}."
-        )
-    if len(K_CLUSTERS_LIST) != len(images_bgr):
-        raise ValueError(
-            f"K_CLUSTERS_LIST must have {len(images_bgr)} values, got {len(K_CLUSTERS_LIST)}."
-        )
 
     part1_outputs = []
     part2_outputs = []
     part3_outputs = []
     part_titles = []
-    elbow_data = []
+    elbow_items = []
 
     for img_bgr, name, lambda_threshold, k_clusters in zip(images_bgr, names, LAMBDA_THRESHOLDS, K_CLUSTERS_LIST):
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # Part1
         hres = harris_corner_detection(
             gray,
             gaussian_ksize=GAUSSIAN_KSIZE,
@@ -293,43 +249,37 @@ def main():
             lambda_threshold=lambda_threshold,
             border_ignore_pixels=BORDER_IGNORE_PIXELS,
         )
-        corners_overlay = draw_corners_overlay(img_bgr, hres.corners_xy, color=(0, 0, 255), radius=2)
+        corners_xy = hres["corners_xy"]
+        corners_overlay = draw_corners_overlay(img_bgr, corners_xy, color=(0, 0, 255), radius=2)
         part1_outputs.append(cv2.cvtColor(corners_overlay, cv2.COLOR_BGR2RGB))
 
-        # Elbow curve (saved for manual K selection).
-        ks, ssd_vals = compute_elbow_curve(
-            hres.corners_xy,
-            k_min=ELBOW_K_MIN,
-            k_max=ELBOW_K_MAX,
-            n_init=ELBOW_N_INIT,
+        elbow = kmeans_cluster(
+            corners_xy,
             max_iters=100,
             tol=1e-3,
+            random_seed=42,
+            elbow_k_min=ELBOW_K_MIN,
+            elbow_k_max=ELBOW_K_MAX,
+            elbow_n_init=ELBOW_N_INIT,
         )
-        elbow_data.append((name, ks, ssd_vals))
+        elbow_items.append((elbow["ks"], elbow["ssd_values"]))
 
-        # Part2
-        labels, centers = kmeans_points(hres.corners_xy, k_clusters=k_clusters, max_iters=100, tol=1e-3, random_seed=42)
+        fit = kmeans_cluster(corners_xy, k_clusters=k_clusters, max_iters=100, tol=1e-3, random_seed=42)
+        labels = fit["labels"]
+        centers = fit["centers"]
         k_used = centers.shape[0]
-        clusters_overlay = draw_clusters_overlay(img_bgr, hres.corners_xy, labels, k_used)
+        clusters_overlay = draw_clusters_overlay(img_bgr, corners_xy, labels, k_used)
         part2_outputs.append(cv2.cvtColor(clusters_overlay, cv2.COLOR_BGR2RGB))
 
-        # Part3
-        bboxes_overlay = draw_cluster_bboxes(
-            img_bgr,
-            hres.corners_xy,
-            labels,
-            k_used,
-            min_points_for_box=5,
-        )
+        bboxes_overlay = draw_cluster_bboxes(img_bgr, corners_xy, labels, k_used, min_points_for_box=5)
         part3_outputs.append(cv2.cvtColor(bboxes_overlay, cv2.COLOR_BGR2RGB))
 
-        part_titles.append(f"{name} | corners={len(hres.corners_xy)} | lambda={lambda_threshold} | K={k_clusters}")
+        part_titles.append(f"{name} | corners={len(corners_xy)} | lambda={lambda_threshold} | K={k_clusters}")
 
-    # Save 3 figures
-    plot_and_save(part1_outputs, part_titles, "part1_corners.png")
-    plot_and_save(part2_outputs, part_titles, "part2_clusters.png")
-    plot_and_save(part3_outputs, part_titles, "part3_bboxes.png")
-    plot_elbow_and_save(elbow_data, "elbow_kmeans.png")
+    plot_and_save(part1_outputs, part_titles, "part1_corners.png", mode="image")
+    plot_and_save(part2_outputs, part_titles, "part2_clusters.png", mode="image")
+    plot_and_save(part3_outputs, part_titles, "part3_bboxes.png", mode="image")
+    plot_and_save(elbow_items, names, "elbow_kmeans.png", mode="elbow")
 
     print("Saved:")
     print(" - elbow_kmeans.png")
